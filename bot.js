@@ -8,11 +8,14 @@ const Sentiment = require('sentiment');
 // Configuration
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
+const COINMARKETCAP_API_KEY = process.env.COINMARKETCAP_API_KEY || '';
 const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID || '';
 const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET || '';
 const REDDIT_USER = process.env.REDDIT_USER || '';
 const REDDIT_PASS = process.env.REDDIT_PASS || '';
 const COINGECKO_API_URL = 'https://api.coingecko.com/api/v3';
+const COINMARKETCAP_API_URL = 'https://pro-api.coinmarketcap.com';
+const COINPAPRIKA_API_URL = 'https://api.coinpaprika.com/v1';
 
 // Log and validate CHAT_ID
 console.log(`Raw CHAT_ID: "${CHAT_ID}" (length: ${CHAT_ID.length}, bytes: ${Buffer.from(CHAT_ID).toString('hex')})`);
@@ -39,43 +42,28 @@ const reddit = new Snoowrap({
 });
 const sentimentAnalyzer = new Sentiment();
 
-// List of symbols to scan
+// Cache for market data
+const marketDataCache = new Map();
+
+// Symbols to scan
 const symbols = [
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT',
   'DOGE/USDT', 'BNB/USDT', 'LTC/USDT', 'LINK/USDT', 'MATIC/USDT'
 ];
 
-// Map symbol to CoinGecko coin ID
-const symbolToCoinId = {
-  'BTC': 'bitcoin',
-  'ETH': 'ethereum',
-  'SOL': 'solana',
-  'XRP': 'ripple',
-  'ADA': 'cardano',
-  'DOGE': 'dogecoin',
-  'BNB': 'binancecoin',
-  'LTC': 'litecoin',
-  'LINK': 'chainlink',
-  'MATIC': 'matic-network'
+// Map symbol to IDs
+const symbolToIds = {
+  'BTC': { coingecko: 'bitcoin', coinmarketcap: 'BTC', coinpaprika: 'btc-bitcoin' },
+  'ETH': { coingecko: 'ethereum', coinmarketcap: 'ETH', coinpaprika: 'eth-ethereum' },
+  'SOL': { coingecko: 'solana', coinmarketcap: 'SOL', coinpaprika: 'sol-solana' },
+  'XRP': { coingecko: 'ripple', coinmarketcap: 'XRP', coinpaprika: 'xrp-xrp' },
+  'ADA': { coingecko: 'cardano', coinmarketcap: 'ADA', coinpaprika: 'ada-cardano' },
+  'DOGE': { coingecko: 'dogecoin', coinmarketcap: 'DOGE', coinpaprika: 'doge-dogecoin' },
+  'BNB': { coingecko: 'binancecoin', coinmarketcap: 'BNB', coinpaprika: 'bnb-binance-coin' },
+  'LTC': { coingecko: 'litecoin', coinmarketcap: 'LTC', coinpaprika: 'ltc-litecoin' },
+  'LINK': { coingecko: 'chainlink', coinmarketcap: 'LINK', coinpaprika: 'link-chainlink' },
+  'MATIC': { coingecko: 'matic-network', coinmarketcap: 'MATIC', coinpaprika: 'matic-polygon' }
 };
-
-// Cache CoinGecko coin list
-let coinList = null;
-async function getCoinId(symbol) {
-  const coinId = symbolToCoinId[symbol.split('/')[0]] || symbol.split('/')[0].toLowerCase();
-  if (coinList === null) {
-    try {
-      console.log('Fetching CoinGecko coin list...');
-      const response = await axios.get(`${COINGECKO_API_URL}/coins/list`, { timeout: 10000 });
-      coinList = response.data;
-    } catch (error) {
-      console.error('Error fetching CoinGecko coin list:', error.message);
-      return 'bitcoin';
-    }
-  }
-  const coin = coinList.find(c => c.id === coinId || c.symbol.toUpperCase() === symbol.split('/')[0]);
-  return coin ? coin.id : 'bitcoin';
-}
 
 // Retry function
 async function withRetry(fn, retries = 3, delay = 1000) {
@@ -90,34 +78,78 @@ async function withRetry(fn, retries = 3, delay = 1000) {
   }
 }
 
-// Fetch market data from CoinGecko
+// Fetch market data with failover
 async function fetchMarketData(symbol, timeframe = '1h', limit = 100) {
-  try {
-    const coinId = await getCoinId(symbol);
-    const days = '1';
-    const url = `${COINGECKO_API_URL}/coins/${coinId}/ohlc?vs_currency=usd&days=${days}`;
-    console.log(`Fetching CoinGecko data: ${url}`);
-    const response = await withRetry(() =>
-      axios.get(url, { timeout: 10000 })
-    );
-    if (!response.data || response.data.length === 0) {
-      throw new Error('No OHLCV data returned');
+  const cacheKey = `${symbol}-${timeframe}-${limit}`;
+  if (marketDataCache.has(cacheKey)) {
+    console.log(`Using cached data for ${symbol}`);
+    return marketDataCache.get(cacheKey);
+  }
+
+  const ids = symbolToIds[symbol.split('/')[0]] || { coingecko: 'bitcoin', coinmarketcap: 'BTC', coinpaprika: 'btc-bitcoin' };
+  const providers = [
+    async () => {
+      const url = `${COINGECKO_API_URL}/coins/${ids.coingecko}/ohlc?vs_currency=usd&days=1`;
+      console.log(`Fetching CoinGecko: ${url}`);
+      const response = await withRetry(() => axios.get(url, { timeout: 10000 }));
+      if (!response.data || response.data.length === 0) throw new Error('No OHLCV data');
+      return response.data.slice(-limit).map(candle => ({
+        timestamp: candle[0],
+        open: candle[1],
+        high: candle[2],
+        low: candle[3],
+        close: candle[4],
+        volume: 0
+      }));
+    },
+    async () => {
+      if (!COINMARKETCAP_API_KEY) throw new Error('CoinMarketCap API key missing');
+      const url = `${COINMARKETCAP_API_URL}/v2/cryptocurrency/ohlcv/historical?symbol=${ids.coinmarketcap}&interval=hourly&count=${limit}`;
+      console.log(`Fetching CoinMarketCap: ${url}`);
+      const response = await withRetry(() =>
+        axios.get(url, {
+          headers: { 'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY },
+          timeout: 10000
+        })
+      );
+      if (!response.data.data[ids.coinmarketcap]) throw new Error('No OHLCV data');
+      return response.data.data[ids.coinmarketcap].quotes.slice(-limit).map(quote => ({
+        timestamp: new Date(quote.timestamp).getTime(),
+        open: quote.quote.USD.open,
+        high: quote.quote.USD.high,
+        low: quote.quote.USD.low,
+        close: quote.quote.USD.close,
+        volume: quote.quote.USD.volume
+      }));
+    },
+    async () => {
+      const url = `${COINPAPRIKA_API_URL}/tickers/${ids.coinpaprika}/historical?interval=1h&limit=${limit}`;
+      console.log(`Fetching Coinpaprika: ${url}`);
+      const response = await withRetry(() => axios.get(url, { timeout: 10000 }));
+      if (!response.data || response.data.length === 0) throw new Error('No OHLCV data');
+      return response.data.slice(-limit).map(candle => ({
+        timestamp: new Date(candle.timestamp).getTime(),
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume
+      }));
     }
-    const ohlcv = response.data.slice(-limit);
-    if (ohlcv.length < limit) {
-      console.warn(`Received ${ohlcv.length} candles, requested ${limit}`);
+  ];
+
+  for (let i = 0; i < providers.length; i++) {
+    try {
+      const data = await providers[i]();
+      marketDataCache.set(cacheKey, data);
+      return data;
+    } catch (error) {
+      console.error(`Provider ${i + 1} failed for ${symbol}:`, error.message);
+      if (i === providers.length - 1) {
+        console.error(`All providers failed for ${symbol}`);
+        return null;
+      }
     }
-    return ohlcv.map(candle => ({
-      timestamp: candle[0],
-      open: candle[1],
-      high: candle[2],
-      low: candle[3],
-      close: candle[4],
-      volume: 0
-    }));
-  } catch (error) {
-    console.error(`Error fetching market data for ${symbol}:`, error.message, error.response?.data || '');
-    return null;
   }
 }
 
@@ -154,35 +186,29 @@ async function analyzeTrend(symbol, data) {
   const lastAtr = atr[atr.length - 1];
 
   // Sentiment
-  const cryptoName = symbolToCoinId[symbol.split('/')[0]] || symbol.split('/')[0].toLowerCase();
+  const cryptoName = symbolToIds[symbol.split('/')[0]]?.coingecko || symbol.split('/')[0].toLowerCase();
   const sentiment = await analyzeSentiment(cryptoName);
 
   // Scoring
   let longScore = 0;
   let shortScore = 0;
 
-  // EMA: 0.3 points
   if (lastEmaFast > lastEmaSlow) longScore += 0.3;
   else if (lastEmaFast < lastEmaSlow) shortScore += 0.3;
 
-  // RSI: 0.2 points
   if (lastRsi < 70) longScore += 0.2;
   if (lastRsi > 30) shortScore += 0.2;
 
-  // MACD: 0.3 points
   if (macdLine > signalLine) longScore += 0.3;
   else if (macdLine < signalLine) shortScore += 0.3;
 
-  // Sentiment: 0.2 points
   if (sentiment === 'POSITIVE') longScore += 0.2;
   else if (sentiment === 'NEGATIVE') shortScore += 0.2;
 
-  // ATR adjustment (lower ATR = less risk)
-  const atrMultiplier = 1 / (1 + lastAtr / currentPrice); // Normalize ATR
+  const atrMultiplier = 1 / (1 + lastAtr / currentPrice);
   longScore *= atrMultiplier;
   shortScore *= atrMultiplier;
 
-  // Stop-loss and take-profit
   const stopLoss = longScore > shortScore
     ? currentPrice - lastAtr * 1.5
     : currentPrice + lastAtr * 1.5;
@@ -236,9 +262,9 @@ bot.onText(/\/analyze(?:\s+(.+))?/, async (msg, match) => {
 
   const marketData = await fetchMarketData(symbol);
   const { longScore, shortScore, stopLoss, takeProfit } = await analyzeTrend(symbol, marketData);
-  const sentiment = await analyzeSentiment(symbolToCoinId[symbol.split('/')[0]] || symbol.split('/')[0].toLowerCase());
+  const sentiment = await analyzeSentiment(symbolToIds[symbol.split('/')[0]]?.coingecko || symbol.split('/')[0].toLowerCase());
 
-  const signal = longScore > shortScore ? 'LONG' : shortScore > longScore ? 'SHORT' : 'NEUTRAL';
+  const signal = longScore > shortScore ? 'LONG' : shortScore > shortScore ? 'SHORT' : 'NEUTRAL';
   let message = `Futures Analysis for ${symbol}:\n` +
                 `Signal: ${signal}\n` +
                 `Confidence: ${(Math.max(longScore, shortScore) * 100).toFixed(1)}%\n` +
@@ -280,7 +306,6 @@ bot.onText(/\/bestopportunity/, async (msg) => {
     return;
   }
 
-  // Find best opportunity
   const best = opportunities.reduce((prev, curr) => {
     const prevScore = Math.max(prev.longScore, prev.shortScore);
     const currScore = Math.max(curr.longScore, curr.shortScore);
@@ -289,7 +314,7 @@ bot.onText(/\/bestopportunity/, async (msg) => {
 
   const signal = best.longScore > best.shortScore ? 'LONG' : 'SHORT';
   const confidence = Math.max(best.longScore, best.shortScore) * 100;
-  const sentiment = await analyzeSentiment(symbolToCoinId[best.symbol.split('/')[0]] || best.symbol.split('/')[0].toLowerCase());
+  const sentiment = await analyzeSentiment(symbolToIds[best.symbol.split('/')[0]]?.coingecko || best.symbol.split('/')[0].toLowerCase());
 
   let message = `Best Futures Opportunity:\n` +
                 `Symbol: ${best.symbol}\n` +
@@ -297,7 +322,7 @@ bot.onText(/\/bestopportunity/, async (msg) => {
                 `Confidence: ${confidence.toFixed(1)}%\n` +
                 `Sentiment: ${sentiment}\n` +
                 `Stop-Loss: ${best.stopLoss ? best.stopLoss.toFixed(2) : 'N/A'}\n` +
-                `Take-Profit: ${best.takeProfit ? best.takeProfit.toFixed(2) : 'N/A'}`;
+                `Take-Profit: ${best.takeProfit ? takeProfit.toFixed(2) : 'N/A'}`;
   if (signal === 'LONG' && sentiment === 'POSITIVE') {
     message += '\nRecommendation: Strong Buy (Futures Long)';
   } else if (signal === 'SHORT' && sentiment === 'NEGATIVE') {
